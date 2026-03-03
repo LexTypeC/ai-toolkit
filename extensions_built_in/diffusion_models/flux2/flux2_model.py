@@ -24,7 +24,9 @@ from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
 from safetensors.torch import load_file, save_file
 from PIL import Image
+from PIL.ImageOps import exif_transpose
 import torch.nn.functional as F
+from torchvision.transforms.functional import to_tensor as tv_to_tensor
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -79,6 +81,8 @@ class Flux2Model(BaseModel):
         self.has_multiple_control_images = True
         # do not resize control images
         self.use_raw_control_images = True
+        # control images are VAE-encoded at runtime, so they can be cached
+        self.supports_control_latent_caching = True
 
     # static method to get the noise scheduler
     @staticmethod
@@ -315,6 +319,121 @@ class Flux2Model(BaseModel):
         ).images[0]
         return img
 
+    @torch.no_grad()
+    def encode_control_for_cache(self, control_paths, target_latent, file_item=None):
+        """Encode control images for latent caching.
+        
+        Performs the same preprocessing and VAE encoding that get_noise_prediction
+        does at runtime, so the results can be cached and reused without the VAE.
+        """
+        if control_paths is None:
+            return None
+
+        if not isinstance(control_paths, list):
+            control_paths = [control_paths]
+
+        # Derive control sizing from the actual preprocessing path
+        height, width = target_latent.shape[-2], target_latent.shape[-1]
+        control_image_max_res = 1024 * 1024
+        match_target_res = self.model_config.model_kwargs.get("match_target_res", False)
+        control_image_res = None
+        if match_target_res:
+            control_image_res = (
+                height * self.pipeline.vae_scale_factor
+                * width * self.pipeline.vae_scale_factor
+            )
+            control_image_max_res = control_image_res
+        elif file_item is not None:
+            if file_item.full_size_control_images:
+                control_image_max_res = file_item.crop_width * file_item.crop_height
+            else:
+                control_image_max_res = 512 * 512
+
+        controls = []
+        for control_path in control_paths:
+            img = Image.open(control_path)
+            img = exif_transpose(img)
+
+            if img.mode in ("RGBA", "LA"):
+                transparent_color = (0, 0, 0)
+                if file_item is not None:
+                    transparent_color = tuple(file_item.dataset_config.control_transparent_color)
+                background = Image.new("RGB", img.size, transparent_color)
+                background.paste(img, mask=img.getchannel("A"))
+                img = background
+            else:
+                img = img.convert("RGB")
+
+            if file_item is not None:
+                if not file_item.full_size_control_images:
+                    img = img.resize((512, 512), Image.BICUBIC)
+                else:
+                    # Apply the exact same spatial transforms as were applied to the
+                    # target image so control and target remain pixel-aligned.
+                    if file_item.flip_x:
+                        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                    if file_item.flip_y:
+                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                    img = img.resize(
+                        (file_item.scale_to_width, file_item.scale_to_height),
+                        Image.BICUBIC,
+                    )
+                    img = img.crop((
+                        file_item.crop_x,
+                        file_item.crop_y,
+                        file_item.crop_x + file_item.crop_width,
+                        file_item.crop_y + file_item.crop_height,
+                    ))
+
+                # Replay spatial augmentations (rotations, distortions, etc.)
+                # that were applied to the target image during latent caching.
+                if getattr(file_item, 'aug_replay_spatial_transforms', None):
+                    aug_tensor = file_item.augment_spatial_control(img, transform=None)
+                    control_img = aug_tensor.unsqueeze(0).to(
+                        self.device_torch, dtype=self.torch_dtype
+                    )
+                    control_img = control_img * 2 - 1
+                    controls.append(control_img)
+                    continue
+            elif match_target_res:
+                control_img_tmp = (
+                    tv_to_tensor(img)
+                    .unsqueeze(0)
+                    .to(self.device_torch, dtype=self.torch_dtype)
+                )
+                ratio = control_img_tmp.shape[2] / control_img_tmp.shape[3]
+                c_width = math.sqrt(control_image_res * ratio)
+                c_height = c_width / ratio
+                c_width = round(c_width / 32) * 32
+                c_height = round(c_height / 32) * 32
+                control_img_tmp = F.interpolate(
+                    control_img_tmp, size=(c_height, c_width), mode="bilinear"
+                )
+                control_img_tmp = control_img_tmp * 2 - 1
+                controls.append(control_img_tmp)
+                continue
+
+            control_img = (
+                tv_to_tensor(img)
+                .unsqueeze(0)
+                .to(self.device_torch, dtype=self.torch_dtype)
+            )
+
+            # scale to -1 to 1
+            control_img = control_img * 2 - 1
+            controls.append(control_img)
+
+        ref_tokens, ref_ids = encode_image_refs(
+            self.vae, controls, limit_pixels=control_image_max_res
+        )
+        if ref_tokens is None:
+            return None
+
+        return {
+            'control_tokens': ref_tokens.squeeze(0).cpu(),
+            'control_ids': ref_ids.squeeze(0).cpu(),
+        }
+
     def get_noise_prediction(
         self,
         latent_model_input: torch.Tensor,
@@ -332,78 +451,98 @@ class Flux2Model(BaseModel):
             img_cond_seq: torch.Tensor | None = None
             img_cond_seq_ids: torch.Tensor | None = None
 
-            # handle control images
-            batch_control_tensor_list = batch.control_tensor_list
-            if batch_control_tensor_list is None and batch.control_tensor is not None:
-                batch_control_tensor_list = []
-                for b in range(latent_model_input.shape[0]):
-                    batch_control_tensor_list.append(batch.control_tensor[b : b + 1])
-
-            if batch_control_tensor_list is not None:
-                batch_size, num_channels_latents, height, width = (
-                    latent_model_input.shape
-                )
-
-                control_image_max_res = 1024 * 1024
-                if self.model_config.model_kwargs.get("match_target_res", False):
-                    # use the current target size to set the control image res
-                    control_image_res = (
-                        height
-                        * self.pipeline.vae_scale_factor
-                        * width
-                        * self.pipeline.vae_scale_factor
+            # Use cached control latents if available (from latent caching phase)
+            if getattr(batch, 'cached_control_tokens', None) is not None:
+                for i in range(len(batch.cached_control_tokens)):
+                    item_tokens = batch.cached_control_tokens[i].unsqueeze(0).to(
+                        self.device_torch, dtype=self.torch_dtype
                     )
-                    control_image_max_res = control_image_res
-
-                if len(batch_control_tensor_list) != batch_size:
-                    raise ValueError(
-                        "Control tensor list length does not match batch size"
-                    )
-                for control_tensor_list in batch_control_tensor_list:
-                    # control tensor list is a list of tensors for this batch item
-                    controls = []
-                    # pack control
-                    for control_img in control_tensor_list:
-                        # control images are 0 - 1 scale, shape (1, ch, height, width)
-                        control_img = control_img.to(
-                            self.device_torch, dtype=self.torch_dtype
-                        )
-                        # if it is only 3 dim, add batch dim
-                        if len(control_img.shape) == 3:
-                            control_img = control_img.unsqueeze(0)
-
-                        # resize to fit within max res while keeping aspect ratio
-                        if self.model_config.model_kwargs.get(
-                            "match_target_res", False
-                        ):
-                            ratio = control_img.shape[2] / control_img.shape[3]
-                            c_width = math.sqrt(control_image_res * ratio)
-                            c_height = c_width / ratio
-
-                            c_width = round(c_width / 32) * 32
-                            c_height = round(c_height / 32) * 32
-
-                            control_img = F.interpolate(
-                                control_img, size=(c_height, c_width), mode="bilinear"
-                            )
-
-                        # scale to -1 to 1
-                        control_img = control_img * 2 - 1
-                        controls.append(control_img)
-
-                    img_cond_seq_item, img_cond_seq_ids_item = encode_image_refs(
-                        self.vae, controls, limit_pixels=control_image_max_res
+                    item_ids = batch.cached_control_ids[i].unsqueeze(0).to(
+                        self.device_torch
                     )
                     if img_cond_seq is None:
-                        img_cond_seq = img_cond_seq_item
-                        img_cond_seq_ids = img_cond_seq_ids_item
+                        img_cond_seq = item_tokens
+                        img_cond_seq_ids = item_ids
                     else:
                         img_cond_seq = torch.cat(
-                            (img_cond_seq, img_cond_seq_item), dim=0
+                            (img_cond_seq, item_tokens), dim=0
                         )
                         img_cond_seq_ids = torch.cat(
-                            (img_cond_seq_ids, img_cond_seq_ids_item), dim=0
+                            (img_cond_seq_ids, item_ids), dim=0
                         )
+            else:
+                # Fall back to encoding control images at runtime (requires VAE)
+                batch_control_tensor_list = batch.control_tensor_list
+                if batch_control_tensor_list is None and batch.control_tensor is not None:
+                    batch_control_tensor_list = []
+                    for b in range(latent_model_input.shape[0]):
+                        batch_control_tensor_list.append(batch.control_tensor[b : b + 1])
+
+                if batch_control_tensor_list is not None:
+                    batch_size, num_channels_latents, height, width = (
+                        latent_model_input.shape
+                    )
+
+                    control_image_max_res = 1024 * 1024
+                    if self.model_config.model_kwargs.get("match_target_res", False):
+                        # use the current target size to set the control image res
+                        control_image_res = (
+                            height
+                            * self.pipeline.vae_scale_factor
+                            * width
+                            * self.pipeline.vae_scale_factor
+                        )
+                        control_image_max_res = control_image_res
+
+                    if len(batch_control_tensor_list) != batch_size:
+                        raise ValueError(
+                            "Control tensor list length does not match batch size"
+                        )
+                    for control_tensor_list in batch_control_tensor_list:
+                        # control tensor list is a list of tensors for this batch item
+                        controls = []
+                        # pack control
+                        for control_img in control_tensor_list:
+                            # control images are 0 - 1 scale, shape (1, ch, height, width)
+                            control_img = control_img.to(
+                                self.device_torch, dtype=self.torch_dtype
+                            )
+                            # if it is only 3 dim, add batch dim
+                            if len(control_img.shape) == 3:
+                                control_img = control_img.unsqueeze(0)
+
+                            # resize to fit within max res while keeping aspect ratio
+                            if self.model_config.model_kwargs.get(
+                                "match_target_res", False
+                            ):
+                                ratio = control_img.shape[2] / control_img.shape[3]
+                                c_width = math.sqrt(control_image_res * ratio)
+                                c_height = c_width / ratio
+
+                                c_width = round(c_width / 32) * 32
+                                c_height = round(c_height / 32) * 32
+
+                                control_img = F.interpolate(
+                                    control_img, size=(c_height, c_width), mode="bilinear"
+                                )
+
+                            # scale to -1 to 1
+                            control_img = control_img * 2 - 1
+                            controls.append(control_img)
+
+                        img_cond_seq_item, img_cond_seq_ids_item = encode_image_refs(
+                            self.vae, controls, limit_pixels=control_image_max_res
+                        )
+                        if img_cond_seq is None:
+                            img_cond_seq = img_cond_seq_item
+                            img_cond_seq_ids = img_cond_seq_ids_item
+                        else:
+                            img_cond_seq = torch.cat(
+                                (img_cond_seq, img_cond_seq_item), dim=0
+                            )
+                            img_cond_seq_ids = torch.cat(
+                                (img_cond_seq_ids, img_cond_seq_ids_item), dim=0
+                            )
 
             img_input = packed_latents
             img_input_ids = img_ids

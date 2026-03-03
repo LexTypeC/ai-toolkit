@@ -137,7 +137,7 @@ class FileItemDTO(
         self.crop_width: int = kwargs.get("crop_width", self.scale_to_width)
         self.crop_height: int = kwargs.get("crop_height", self.scale_to_height)
         self.flip_x: bool = kwargs.get("flip_x", False)
-        self.flip_y: bool = kwargs.get("flip_x", False)
+        self.flip_y: bool = kwargs.get("flip_y", False)
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 
@@ -264,6 +264,21 @@ class DataLoaderBatchDTO:
                     else:
                         raise Exception(
                             f"Could not find control tensors for all file items, missing for {x.path}"
+                        )
+
+            # handle cached control latents (from latent caching phase)
+            self.cached_control_tokens: Union[List[torch.Tensor], None] = None
+            self.cached_control_ids: Union[List[torch.Tensor], None] = None
+            if any([getattr(x, '_cached_control_tokens', None) is not None for x in self.file_items]):
+                self.cached_control_tokens = []
+                self.cached_control_ids = []
+                for x in self.file_items:
+                    if x._cached_control_tokens is not None:
+                        self.cached_control_tokens.append(x._cached_control_tokens)
+                        self.cached_control_ids.append(x._cached_control_ids)
+                    else:
+                        raise Exception(
+                            f"Could not find cached control latents for all file items, missing for {x.path}"
                         )
 
             self.inpaint_tensor: Union[torch.Tensor, None] = None
@@ -445,6 +460,8 @@ class DataLoaderBatchDTO:
         del self.latents
         del self.tensor
         del self.control_tensor
+        del self.cached_control_tokens
+        del self.cached_control_ids
         del self.audio_tensor
         del self.audio_data
         del self.audio_target

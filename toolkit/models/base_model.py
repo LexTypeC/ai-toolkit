@@ -185,6 +185,8 @@ class BaseModel:
         self.has_multiple_control_images = False
         # do not resize control images
         self.use_raw_control_images = False
+        # set true for models that cache control latents alongside target latents
+        self.supports_control_latent_caching = False
         # defines if the model supports model paths. Only some will
         self.supports_model_paths = False
         
@@ -1081,6 +1083,20 @@ class BaseModel:
             return self.get_prompt_embeds(prompt, control_images=control_images)
 
         return self.get_prompt_embeds(prompt)
+
+    def encode_control_for_cache(self, control_paths, target_latent, file_item=None):
+        """Encode control images for latent caching.
+        Override in subclasses that need control images VAE-encoded during the
+        latent caching phase (e.g. Flux2/Klein edit models).
+
+        Args:
+            control_paths: str or list of str - paths to control images
+            target_latent: the encoded target latent (used to derive target resolution)
+
+        Returns:
+            dict of {key: tensor} to add to the latent cache, or None
+        """
+        return None
 
     @torch.no_grad()
     def encode_images(
